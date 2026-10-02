@@ -1531,6 +1531,8 @@ def weight_sync_thread(
             sync_time_stats, _ = grpo_utils.perform_weight_sync(
                 broadcast_refs, vllm_engines, actor_manager, progress=args.verbose, inflight_updates=inflight_updates
             )
+            # Synchronous mode (async_steps=0) waits for this before generating the next batch.
+            ray.get(actor_manager.set_synced_model_step.remote(target_model_step))
         except Exception as e:
             logger.exception("[Weight Sync Thread] Weight Sync failed")
             raise RuntimeError from e

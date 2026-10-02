@@ -45,7 +45,7 @@ uv run --active open_instruct/grpo_fast.py \
     --single_gpu_mode \
     --beta 0.0 \
     --load_ref_policy false \
-    --async_steps 1 \
+    --async_steps 0 \
     --inflight_updates false \
     --gradient_checkpointing \
     --seed 1 \

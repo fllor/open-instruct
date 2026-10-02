@@ -54,6 +54,8 @@ class ActorManager:
         self._training_step_history = collections.deque(maxlen=self._sample_window)
         self._generation_batch_history = collections.deque(maxlen=self._sample_window)
         self._kv_cache_max_concurrency = 0
+        # Latest model step whose weights are loaded in all vLLM engines (-1 = none yet).
+        self._synced_model_step = -1
         self._args = args
         self._streaming_config = streaming_config
         self._vllm_config = vllm_config
@@ -138,6 +140,13 @@ class ActorManager:
     def should_stop(self) -> bool:
         """Check if actors should stop processing."""
         return self._should_stop
+
+    def set_synced_model_step(self, model_step: int):
+        """Record that all vLLM engines now serve the weights of `model_step`."""
+        self._synced_model_step = max(self._synced_model_step, model_step)
+
+    def get_synced_model_step(self) -> int:
+        return self._synced_model_step
 
     def report_token_stats(self, prompt_tokens: int, generation_tokens: int):
         """Report token statistics from main thread."""
