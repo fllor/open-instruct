@@ -70,7 +70,7 @@ import torch.utils.data
 import wandb
 from datasets import Dataset
 from huggingface_hub import HfApi
-from peft import PeftModel, get_peft_model_state_dict
+from peft import LoraConfig, PeftModel, get_peft_model
 from ray.util import queue as ray_queue
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -367,12 +367,27 @@ class PolicyTrainerRayProcess(RayProcess):
         )
         self._model_name_or_path = model_config.model_name_or_path
         self.policy.config.use_cache = False
+        self.use_peft = model_config.use_peft
+        if self.use_peft:
+            # LoRA: only the adapter is trained; vLLM serves the same adapter natively (no weight merging).
+            if args.deepspeed_stage == 3:
+                raise ValueError("--use_peft is not supported with --deepspeed_stage 3; use stage 0 or 2.")
+            self.policy.enable_input_require_grads()  # needed for gradient checkpointing with a frozen base
+            peft_config = LoraConfig(
+                r=model_config.lora_r,
+                lora_alpha=model_config.lora_alpha,
+                lora_dropout=0.0,
+                target_modules=model_config.lora_target_modules or "all-linear",
+                task_type="CAUSAL_LM",
+            )
+            self.policy = get_peft_model(self.policy, peft_config)
+            self.policy.print_trainable_parameters()
         disable_dropout_in_model(self.policy)
         self.policy.gradient_checkpointing_enable()
         if args.set_weight_decay_on_bias_and_norm:
             optim_params = get_optimizer_grouped_parameters(self.policy, args.weight_decay)
         else:
-            optim_params = self.policy.parameters()
+            optim_params = [p for p in self.policy.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(optim_params, lr=args.learning_rate, fused=args.fused_optimizer)
         num_scheduler_steps = args.num_training_steps * args.num_epochs * args.num_mini_batches
         warmup_steps = int(num_scheduler_steps * args.warmup_ratio)
@@ -510,6 +525,9 @@ class PolicyTrainerRayProcess(RayProcess):
     def setup_model_update_group(self, vllm_engines):
         self.vllm_engines = vllm_engines
         self.model_update_group = None
+        if self.use_peft:
+            # Adapters are synced through files (see broadcast_to_vllm); no weight-transfer group needed.
+            return
         if self.rank == 0:
             if self.args.single_gpu_mode:
                 init_infos: list[dict] = [{} for _ in vllm_engines]
@@ -552,6 +570,8 @@ class PolicyTrainerRayProcess(RayProcess):
             self.model(input_ids=input_ids)
 
     def broadcast_to_vllm(self, model_step: int):
+        if self.use_peft:
+            return self._sync_lora_adapter_to_vllm(model_step)
         # avoid OOM
         torch.cuda.empty_cache()
         # Ensure CUDA device is set before broadcast operations.
@@ -565,6 +585,18 @@ class PolicyTrainerRayProcess(RayProcess):
             gather_whole_model=self.args.gather_whole_model,
             name_mapper=_build_vlm_name_mapper(self._model_name_or_path),
         )
+
+    def _sync_lora_adapter_to_vllm(self, model_step: int) -> list[ray.ObjectRef]:
+        """Save the LoRA adapter for `model_step` and have every vLLM engine load it.
+
+        The saved adapters (one directory per step) double as the record of parameter changes.
+        """
+        if self.rank != 0:
+            return []
+        adapter_dir = os.path.join(self.args.output_dir, "lora_adapters", f"step_{model_step}")
+        self.model.module.save_pretrained(adapter_dir)
+        # The engines pause themselves inside load_lora_adapter, after draining in-flight requests.
+        return [engine.load_lora_adapter.remote(adapter_dir, model_step) for engine in self.vllm_engines]
 
     def update_ref_policy(self):
         if not self.args.load_ref_policy:
@@ -878,11 +910,8 @@ class PolicyTrainerRayProcess(RayProcess):
 
             # only save peft weights https://github.com/microsoft/DeepSpeed/issues/4295
             if isinstance(model_to_save, PeftModel):
+                # ZeRO-3 is rejected with --use_peft, so parameters are already complete here.
                 model_to_save.save_pretrained(output_dir)
-                if self.stage == 3:
-                    torch.save(
-                        get_peft_model_state_dict(model_to_save, output_state_dict), output_path / "adapter_model.bin"
-                    )
             else:
                 model_to_save.save_pretrained(output_dir, state_dict=output_state_dict)
 
@@ -1372,6 +1401,7 @@ def create_model_and_optimizer(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         vllm_attention_backend=vllm_config.vllm_attention_backend,
+        lora_rank=model_config.lora_r if model_config.use_peft else None,
     )
     logger.info("======== ✅ vLLM engines and actor_manager initialized =========")
 
@@ -2017,9 +2047,10 @@ def run_training(
                 )
                 logger.info(f"Saved checkpoint state at step {training_step} to {args.checkpoint_state_dir}")
 
-        if training_step > resume_training_step:
-            logger.debug(f"[Main Thread] Triggered weight sync for step {training_step}")
-            weight_sync_trigger.notify(step=training_step)
+        # Sync after every step, including the first one after (re)start; otherwise the policy from
+        # step `resume_training_step` is never served by vLLM.
+        logger.debug(f"[Main Thread] Triggered weight sync for step {training_step}")
+        weight_sync_trigger.notify(step=training_step)
 
         last_eval_collected = grpo_utils.maybe_evaluate(
             args,

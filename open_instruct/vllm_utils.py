@@ -48,6 +48,7 @@ from vllm.distributed.weight_transfer.ipc_engine import IPCTrainerSendWeightsArg
 from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.entrypoints.openai.cli_args import make_arg_parser
+from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest, UnloadLoRAAdapterRequest
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -626,6 +627,8 @@ class LLMRayActor:
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.current_model_step: int = 0
+        # Name of the LoRA adapter that requests are routed to (None = base model).
+        self.lora_name: str | None = None
         self._train_index_map: dict[int, int] = (
             {train_dataset[i]["index"]: i for i in range(len(train_dataset))} if train_dataset is not None else {}
         )
@@ -706,6 +709,7 @@ class LLMRayActor:
             args = _create_server_args(engine_client.vllm_config.model_config.model, has_chat_template)
             app = build_app(args)
             await init_app_state(engine_client, app.state, args)
+            self.serving_models = app.state.openai_serving_models
 
             # There is a TOCTOU race: another process could claim the port between
             # find_free_port() and uvicorn binding. Unlikely in practice.
@@ -800,6 +804,31 @@ class LLMRayActor:
         self._run_async(self.llm_engine.update_weights(WeightTransferUpdateRequest(**update_info)))
         if model_step is not None:
             self.current_model_step = model_step
+
+    def load_lora_adapter(self, adapter_path: str, model_step: int) -> None:
+        """Serve the LoRA adapter at `adapter_path` for all subsequent requests.
+
+        Each step gets a fresh adapter name: vLLM keys its prefix cache by adapter name, so reusing
+        one name would let new requests hit KV cache computed with the previous adapter.
+
+        In-flight requests are drained *before* pausing the engine: a paused engine (mode="keep")
+        cannot finish them, so draining afterwards would wait forever. perform_weight_sync wakes
+        the engine up again after the load.
+        """
+        while not self.inflight_updates and len(self.active_tasks) > 0:
+            self.check_background_threads()
+            time.sleep(DRAIN_ACTIVE_TASKS_SLEEP_S)
+        self.sleep()
+        new_name = f"policy_step_{model_step}"
+        result = self._run_async(
+            self.serving_models.load_lora_adapter(LoadLoRAAdapterRequest(lora_name=new_name, lora_path=adapter_path))
+        )
+        if not isinstance(result, str):
+            raise RuntimeError(f"Failed to load LoRA adapter {adapter_path}: {result}")
+        old_name, self.lora_name = self.lora_name, new_name
+        self.current_model_step = model_step
+        if old_name is not None and old_name != new_name:
+            self._run_async(self.serving_models.unload_lora_adapter(UnloadLoRAAdapterRequest(lora_name=old_name)))
 
     def reset_prefix_cache(self) -> None:
         return self._run_async(self.llm_engine.reset_prefix_cache())
@@ -1007,7 +1036,7 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
             params_dict = dataclasses.asdict(current_sampling_params)
             min_tokens = params_dict.pop("min_tokens", 0)
             api_response = await actor.client.completions.create(
-                model=actor.model_name,
+                model=actor.lora_name or actor.model_name,
                 prompt=current_prompt,
                 extra_body={
                     "return_token_ids": True,
@@ -1185,6 +1214,21 @@ def get_cuda_arch_list() -> str:
     return cuda_arch_list
 
 
+def flatten_olmo3_rope_parameters(config):
+    """vLLM `hf_overrides` hook: give vLLM's Olmo 3 model the flat RoPE config it expects.
+
+    transformers>=5.13 stores Olmo 3 RoPE parameters per layer type ({"full_attention": {...},
+    "sliding_attention": {...}}). vLLM's Olmo2/Olmo3 implementation reads a flat dict, applies it to
+    full-attention layers and plain RoPE (same rope_theta) to sliding layers, which is exactly the
+    full-attention entry. Other models are returned unchanged.
+    """
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if getattr(config, "model_type", None) == "olmo3" and isinstance(rope_parameters, dict):
+        if "full_attention" in rope_parameters:
+            config.rope_parameters = dict(rope_parameters["full_attention"])
+    return config
+
+
 def create_vllm_engines(
     num_engines: int,
     tensor_parallel_size: int,
@@ -1215,6 +1259,7 @@ def create_vllm_engines(
     eval_dataset=None,
     trust_remote_code: bool = False,
     vllm_attention_backend: str | None = None,
+    lora_rank: int | None = None,
 ) -> list[ray.actor.ActorHandle]:
     vllm_engines = []
     # Use "mp" (multiprocessing) for TP > 1 when running inside a Ray actor.
@@ -1303,6 +1348,9 @@ def create_vllm_engines(
                 trust_remote_code=trust_remote_code,
                 attention_backend=vllm_attention_backend,
                 language_model_only=True,
+                hf_overrides=flatten_olmo3_rope_parameters,
+                # Room for the current and the previous step's adapter while swapping.
+                **({"enable_lora": True, "max_lora_rank": lora_rank, "max_loras": 2} if lora_rank else {}),
             )
         )
 
