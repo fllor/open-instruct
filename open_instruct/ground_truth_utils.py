@@ -11,6 +11,7 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import string
@@ -692,6 +693,29 @@ class UpToMaxLenVerifier(VerifierFunction):
             type: The VerifierConfig class or its subclass
         """
         return MaxLengthVerifierConfig
+
+
+class HiddenLengthVerifier(VerifierFunction):
+    """
+    Reward for matching a target length in words that the prompt never states: -|log(words / target)|.
+
+    The ground truth (label) is the target number of words. The reward is 0 at the target, symmetric in
+    "too long" and "too short" on a log scale, and never saturates.
+    """
+
+    def __init__(self, verifier_config: VerifierConfig | None = None) -> None:
+        super().__init__("hidden_length", verifier_config=verifier_config, weight=1.0)
+
+    def __call__(
+        self,
+        tokenized_prediction: list[int],
+        prediction: str,
+        label: str,
+        query: str | None = None,
+        rollout_state: dict | None = None,
+    ) -> VerificationResult:
+        num_words = max(len(prediction.split()), 1)
+        return VerificationResult(score=-abs(math.log(num_words / float(label))))
 
 
 class LMJudgeVerifier(VerifierFunction):
