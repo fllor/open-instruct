@@ -419,7 +419,8 @@ class PolicyTrainerRayProcess(RayProcess):
                 self.model.mpu = None
                 path, states = self.model.load_checkpoint(
                     args.checkpoint_state_dir,
-                    load_module_strict=True,
+                    # With LoRA, checkpoints hold only the trainable adapter (see save_checkpoint_state).
+                    load_module_strict=not self.use_peft,
                     load_optimizer_states=True,
                     load_lr_scheduler_states=True,
                     load_module_only=False,
@@ -841,7 +842,9 @@ class PolicyTrainerRayProcess(RayProcess):
         if self.model.mpu is not None:
             old_mpu = self.mpu
             self.model.mpu = None
-        self.model.save_checkpoint(checkpoint_state_dir, client_state=client_state)
+        self.model.save_checkpoint(
+            checkpoint_state_dir, client_state=client_state, exclude_frozen_parameters=self.use_peft
+        )
 
         # `save_checkpoint` needs to be called on all ranks, only rank 0 will have all the states
         if self.rank == 0:
