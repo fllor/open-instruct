@@ -11,6 +11,7 @@ C=${C:-0.6}
 STEPS=${STEPS:-10}
 LR=${LR:-1e-5}
 SEED=${SEED:-1}
+LORA_R=${LORA_R:-32}  # lora_alpha = 2 * LORA_R keeps alpha/r = 2
 EXP=${EXP:-hl_c${C}_${STEPS}steps}
 DATA=${DATA:-/workspace/data/hidden_length}
 
@@ -27,8 +28,8 @@ uv run --active open_instruct/grpo_fast.py \
     --model_name_or_path allenai/Olmo-3-7B-Instruct-DPO \
     --chat_template_name tokenizer_default \
     --use_peft \
-    --lora_r 32 \
-    --lora_alpha 64 \
+    --lora_r "$LORA_R" \
+    --lora_alpha $((2 * LORA_R)) \
     --dataset_mixer_list "$DATA/train_c${C}.jsonl" 1.0 \
     --dataset_mixer_list_splits train \
     --dataset_mixer_eval_list "$DATA/readout.jsonl" 16 \

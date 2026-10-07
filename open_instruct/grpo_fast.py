@@ -49,6 +49,7 @@ from open_instruct.rubrics.evolving_rubric_step import RUBRIC_TABLE_COLUMNS, RUB
 # isort: on
 import asyncio
 import dataclasses
+import json
 import logging
 import math
 import random
@@ -63,6 +64,7 @@ import backoff
 import datasets
 import numpy as np
 import ray
+import safetensors.torch
 import torch
 import torch.distributed as dist
 import torch.utils
@@ -459,6 +461,19 @@ class PolicyTrainerRayProcess(RayProcess):
                     f"{self.rank=}: Loaded checkpoint from {args.checkpoint_state_dir} with {optimization_steps_done=}"
                 )
         self.model.train()
+        self.optim_steps_done = optimization_steps_done
+        if args.save_optimizer_state:
+            if args.deepspeed_stage not in (1, 2):
+                raise NotImplementedError("--save_optimizer_state reads DeepSpeed ZeRO stage 1/2 optimizer internals")
+            self.optim_steps_done = self._adam_step_counter()
+            if len(self.model.optimizer.optimizer.param_groups) != 1:
+                # DeepSpeed 0.18.4 links the moment fragments of later groups before Adam creates them.
+                raise NotImplementedError("--save_optimizer_state supports a single optimizer param group (LoRA)")
+            if self.optim_steps_done > 0:
+                # Restored Adam moments are linked to parameter fragments only lazily, at the next step.
+                self.model.optimizer._lazy_init_hp_params_optimizer_state()
+            # The starting point of the first update: fresh weights, or the state restored from a checkpoint.
+            self._save_optimizer_state(self.optim_steps_done, applied_lr=None, grad_norm=None, loss_denominator=None)
 
         # reference model
         if args.load_ref_policy:
@@ -764,8 +779,14 @@ class PolicyTrainerRayProcess(RayProcess):
                     self.model.set_gradient_accumulation_boundary(is_accumulation_boundary)
                     self.model.backward(loss)
                     if is_accumulation_boundary:
+                        applied_lr = self.scheduler.get_last_lr()[0]  # DeepSpeed advances the scheduler in step()
                         self.model.step()
                         grad_norms.append(float(self.model.get_global_grad_norm()))
+                        self.optim_steps_done += 1
+                        if self.args.save_optimizer_state:
+                            self._save_optimizer_state(
+                                self.optim_steps_done, applied_lr, grad_norms[-1], float(loss_denominator)
+                            )
                     local_step += 1
                     grpo_utils.populate_sample_loss_stats(
                         loss_stats_B,
@@ -797,6 +818,65 @@ class PolicyTrainerRayProcess(RayProcess):
                 if self.rank == 0:
                     array_metrics.update(grpo_utils.finalize_rho_histograms(rho_histograms))
                 return self.local_metrics.get_metrics_list(), array_metrics
+
+    def _adam_step_counter(self) -> int:
+        """Optimizer updates done so far, from the (possibly checkpoint-restored) Adam state."""
+        inner = self.model.optimizer.optimizer
+        state = inner.state.get(inner.param_groups[0]["params"][0], {})
+        return int(state["step"]) if "step" in state else 0
+
+    def _save_optimizer_state(
+        self, optim_step: int, applied_lr: float | None, grad_norm: float | None, loss_denominator: float | None
+    ) -> None:
+        """Write the fp32 master weights and Adam moments of the trainable parameters after `optim_step` updates.
+
+        Gradient diagnostics read θ_{t+1} − θ_t and Adam's preconditioner from these files. DeepSpeed creates
+        Adam's state lazily at the first step, so step_0 holds the weights only (moments zero, τ = 0). The
+        DeepSpeed helpers all-reduce, so every rank must call this; only rank 0 writes.
+        """
+        tensors = {}
+        for name, param in self.model.module.named_parameters():
+            if not param.requires_grad:
+                continue
+            keys = ["theta"] + (["exp_avg", "exp_avg_sq"] if optim_step > 0 else [])
+            for key in keys:
+                if key == "theta":
+                    value = deepspeed.utils.safe_get_full_fp32_param(param)
+                else:
+                    value = deepspeed.utils.safe_get_full_optimizer_state(param, key)
+                if value is None:
+                    raise RuntimeError(f"No fp32 {key} for {name}: optimizer state export needs ZeRO stage 1 or 2")
+                tensors[f"{key}/{name}"] = value.detach().float().cpu().contiguous()
+        if self.rank != 0:
+            return
+        # The scalar step counter is not linked into the per-parameter fragments: read it from the inner
+        # optimizer, whose param groups each hold one flat fp32 partition.
+        zero_optimizer = self.model.optimizer
+        names = {id(p): n for n, p in self.model.module.named_parameters()}
+        param_groups = []
+        for i, group in enumerate(zero_optimizer.optimizer.param_groups):
+            state = zero_optimizer.optimizer.state.get(group["params"][0], {})
+            tau = int(state["step"]) if "step" in state else 0
+            if tau != optim_step:
+                raise RuntimeError(f"Adam step counter {tau} in param group {i} != optimizer steps done {optim_step}")
+            hyper = {k: v for k, v in group.items() if k != "params"}
+            hyper["step"] = tau
+            hyper["param_names"] = [names[id(p)] for p in zero_optimizer.bit16_groups[i]]
+            param_groups.append(hyper)
+        metadata = {
+            "optim_step": optim_step,
+            "applied_lr": applied_lr,
+            "pre_clip_grad_norm": grad_norm,
+            "loss_denominator": loss_denominator,
+            "max_grad_norm": self.args.max_grad_norm,
+            "world_size": self.args.world_size,
+            "param_groups": param_groups,
+        }
+        out_dir = os.path.join(self.args.output_dir, "optim_state")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"step_{optim_step}.safetensors")
+        safetensors.torch.save_file(tensors, path + ".tmp", metadata={"json": json.dumps(metadata, default=str)})
+        os.replace(path + ".tmp", path)
 
     def save_checkpoint_state(self, checkpoint_state_dir: str, client_state: dict[str, Any]) -> None:
         args = self.args

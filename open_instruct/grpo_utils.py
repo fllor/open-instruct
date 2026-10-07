@@ -207,6 +207,10 @@ class GRPOExperimentConfig(
     """Where to save the model checkpoint (if applicable)"""
     gs_checkpoint_state_dir: str | None = None
     """The actual `checkpoint_state_dir` to use (handling the case where gs_bucket_path is provided)"""
+    save_optimizer_state: bool = False
+    """Write the fp32 master weights and Adam moments of the trainable parameters after every optimizer step to
+    `<output_dir>/optim_state/step_N.safetensors` (step_0: initial weights only), for gradient diagnostics.
+    Needs --deepspeed_stage 1 or 2 and a single optimizer param group (LoRA)"""
 
     # Ai2 specific settings
     try_launch_beaker_eval_jobs_on_weka: bool = False
