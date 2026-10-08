@@ -18,6 +18,7 @@
 import argparse
 import asyncio
 import dataclasses
+import hashlib
 import os
 import queue
 import sys
@@ -145,6 +146,8 @@ class SamplingConfig:
     stop: list[str] | None = None
     seed: int | None = None
     logprobs: int | None = 1
+    seed_per_prompt: bool = False
+    """Offset the seed by a hash of the prompt id (see add_request); not sent to vLLM."""
 
 
 @dataclasses.dataclass
@@ -461,8 +464,13 @@ def add_request(actor: "LLMRayActor", request: PromptRequest) -> None:
         "ground_truth": request.ground_truth,
     }
 
+    base_seed = request.generation_config.seed
+    if base_seed is not None and request.generation_config.seed_per_prompt:
+        digest = hashlib.sha256(f"{base_seed}:{request.prompt_id}".encode()).digest()
+        base_seed = int.from_bytes(digest[:7], "little") * 64  # distinct per prompt, room for n <= 64 samples
+        assert request.generation_config.n <= 64
     for j in range(request.generation_config.n):
-        seed = request.generation_config.seed + j if request.generation_config.seed is not None else None
+        seed = base_seed + j if base_seed is not None else None
         sub_sampling_params = dataclasses.replace(sampling_params, seed=seed)
         sub_request_id = f"{request_id}_{j}"
         actor.active_tasks[sub_request_id] = asyncio.run_coroutine_threadsafe(
@@ -1035,6 +1043,7 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
             current_sampling_params = dataclasses.replace(sampling_params, max_tokens=current_max_tokens)
             params_dict = dataclasses.asdict(current_sampling_params)
             min_tokens = params_dict.pop("min_tokens", 0)
+            params_dict.pop("seed_per_prompt", None)
             api_response = await actor.client.completions.create(
                 model=actor.lora_name or actor.model_name,
                 prompt=current_prompt,

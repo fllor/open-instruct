@@ -211,6 +211,12 @@ class GRPOExperimentConfig(
     """Write the fp32 master weights and Adam moments of the trainable parameters after every optimizer step to
     `<output_dir>/optim_state/step_N.safetensors` (step_0: initial weights only), for gradient diagnostics.
     Needs --deepspeed_stage 1 or 2 and a single optimizer param group (LoRA)"""
+    lora_fp32_add: bool = False
+    """Add LoRA outputs to the base layers' fp32 matmul output before rounding to bf16, in vLLM and in the trainer
+    (open_instruct/lora_numerics.py). Without it, LoRA contributions below half a bf16 step of the base output are dropped"""
+    vllm_seed_per_prompt: bool = False
+    """Derive each prompt's sampling seeds from --seed and its prompt id (epoch and dataset index), instead of
+    reusing seed + j for every prompt and step (which correlates the samples of all prompts)"""
 
     # Ai2 specific settings
     try_launch_beaker_eval_jobs_on_weka: bool = False

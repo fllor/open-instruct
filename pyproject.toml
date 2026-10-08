@@ -51,6 +51,9 @@ dependencies = [
     "tilelang>=0.1.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 
+[project.entry-points."vllm.general_plugins"]
+lora_fp32_add = "open_instruct.lora_numerics:register_vllm_plugin"
+
 [build-system]
 requires = ["setuptools", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"

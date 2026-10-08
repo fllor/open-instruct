@@ -82,7 +82,7 @@ from transformers.integrations import HfDeepSpeedConfig
 from vllm.distributed.weight_transfer.base import WeightTransferInitRequest
 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
-from open_instruct import grpo_fast_resource_plan, logger_utils, model_utils, vllm_utils
+from open_instruct import grpo_fast_resource_plan, logger_utils, lora_numerics, model_utils, vllm_utils
 from open_instruct.actor_manager import ActorManager
 from open_instruct.data_types import ShutdownSentinel
 from open_instruct.dataset_transformation import (
@@ -384,6 +384,8 @@ class PolicyTrainerRayProcess(RayProcess):
             )
             self.policy = get_peft_model(self.policy, peft_config)
             self.policy.print_trainable_parameters()
+            if lora_numerics.enabled():
+                lora_numerics.patch_peft()
         disable_dropout_in_model(self.policy)
         self.policy.gradient_checkpointing_enable()
         if args.set_weight_decay_on_bias_and_norm:
@@ -1555,6 +1557,7 @@ def create_generation_configs(
         stop=streaming_config.stop_strings,
         seed=args.seed,
         logprobs=1,
+        seed_per_prompt=args.vllm_seed_per_prompt,
     )
     eval_generation_config = dataclasses.replace(
         generation_config,
@@ -2324,6 +2327,11 @@ def main(
             handler.setLevel(logging.DEBUG)
 
     beaker_config, wandb_url = setup_experiment_tracking(args, tc, model_config, streaming_config, vllm_config)
+
+    if args.lora_fp32_add:
+        if not model_config.use_peft:
+            raise ValueError("--lora_fp32_add needs --use_peft")
+        os.environ.update(lora_numerics.ENV)  # reaches the Ray actors and vLLM's engine processes
 
     # We have to initialize ray earlier for constructing Tools (they are implemented as ray actors).
     ray.init(
