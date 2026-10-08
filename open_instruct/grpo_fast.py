@@ -2332,6 +2332,7 @@ def main(
         if not model_config.use_peft:
             raise ValueError("--lora_fp32_add needs --use_peft")
         os.environ.update(lora_numerics.ENV)  # reaches the Ray actors and vLLM's engine processes
+        os.environ[lora_numerics.REPORT_DIR_ENV] = args.output_dir  # each patched process records itself there
 
     # We have to initialize ray earlier for constructing Tools (they are implemented as ray actors).
     ray.init(
